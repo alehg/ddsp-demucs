@@ -1,0 +1,14 @@
+# Large residual DDSP model configuration
+
+_base_: base.yaml
+
+model:
+  n_harmonics: 128
+  n_noise_bands: 129
+  rnn_units: 512
+  mlp_units: [512, 256, 128]
+
+training:
+  batch_size: 4
+  learning_rate: 1e-3
+

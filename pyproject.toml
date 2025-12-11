@@ -1,0 +1,68 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ddsp-demucs"
+version = "0.1.0"
+description = "Combining Hybrid Transformer Demucs with Differentiable DSP for vocal separation"
+readme = "README.md"
+requires-python = ">=3.9"
+license = {text = "MIT"}
+authors = [
+    {name = "Your Name", email = "your.email@example.com"}
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+]
+
+dependencies = [
+    "numpy>=2.0.0",
+    "scipy>=1.10.0",
+    "pandas>=2.0.0",
+    "librosa>=0.10.0",
+    "soundfile>=0.12.0",
+    "torch>=2.0.0",
+    "torchaudio>=2.0.0",
+    "torchcrepe>=0.0.20",
+    "demucs>=4.0.0",
+    "musdb>=0.4.0",
+    "stempeg>=0.2.0",
+    "museval>=0.4.0",
+    "tensorflow>=2.20.0",
+    "tf-keras>=2.20.0",
+    "tensorflow-probability>=0.25.0",
+    "jax>=0.4.28",
+    "flax>=0.8.2",
+    "optax>=0.2.2",
+    "pyyaml>=6.0",
+    "tqdm>=4.65.0",
+    "matplotlib>=3.7.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0.0",
+    "black>=23.0.0",
+    "flake8>=6.0.0",
+    "mypy>=1.0.0",
+]
+
+[project.scripts]
+ddsp-train = "ddsp_demucs.train:main"
+ddsp-eval = "ddsp_demucs.evaluate:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.black]
+line-length = 100
+target-version = ['py39', 'py310', 'py311', 'py312']
+
