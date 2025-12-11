@@ -1,0 +1,88 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Virtual environments
+venv/
+env/
+ENV/
+.venv
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb_checkpoints
+
+# Data (don't commit datasets)
+data/
+*.wav
+*.mp3
+*.flac
+*.ogg
+
+# Experiments and logs
+exp/
+logs/
+runs/
+checkpoints/
+*.ckpt
+*.h5
+*.pth
+*.pt
+
+# TensorBoard
+tb/
+tensorboard/
+
+# Cache
+.cache/
+__pycache__/
+*.pyc
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Environment
+.env
+.env.local
+
+# Temporary files
+*.tmp
+*.temp
+*.log
+
+# Large model files
+*.pkl
+*.pickle
+*.model
+
+# Colab
+/content/
+/drive/
+

@@ -1,0 +1,48 @@
+# Base configuration for DDSP-Demucs
+
+dataset:
+  kind: hq
+  root: data/musdb18hq
+  sample_rate: 44100
+
+paths:
+  project: .
+  stems_dir: data/stems/demucs_htdemucs44k
+  features_dir: data/features
+  tfrecords_dir: data/tfrecords
+  exp_dir: exp
+
+mono_downmix: avg_lr
+
+gate_thresholds:
+  f0_conf_min: 0.65
+  harmonicity_ratio_min: 0.65
+  residual_energy_ratio_max: 0.38
+  mono_frame_fraction_min: 0.8
+  mono_track_fraction_min: 0.88
+
+training:
+  sample_rate: 22050
+  frame_rate: 250
+  batch_size: 8
+  learning_rate: 1e-3
+  epochs: 50
+  validation_split: 0.1
+
+model:
+  n_harmonics: 64
+  n_noise_bands: 65
+  rnn_units: 256
+  mlp_units: [256, 128]
+  f0_midi_range: [24.0, 84.0]
+
+loss:
+  fft_sizes: [2048, 1024, 512, 256, 128, 64]
+  loss_type: L1
+  mag_weight: 1.0
+  logmag_weight: 0.2
+  delta_freq_weight: 0.2
+  delta_time_weight: 0.05
+  mel_weight: 1.0
+  centroid_weight: 0.05
+
