@@ -24,7 +24,7 @@ classifiers = [
 ]
 
 dependencies = [
-    "numpy>=2.0.0",
+    "numpy>=1.26.0,<2.0.0",
     "scipy>=1.10.0",
     "pandas>=2.0.0",
     "librosa>=0.10.0",
@@ -36,8 +36,8 @@ dependencies = [
     "musdb>=0.4.0",
     "stempeg>=0.2.0",
     "museval>=0.4.0",
-    "tensorflow>=2.20.0",
-    "tf-keras>=2.20.0",
+    "tensorflow>=2.16.0",
+    "tf-keras>=2.16.0",
     "tensorflow-probability>=0.25.0",
     "jax>=0.4.28",
     "flax>=0.8.2",

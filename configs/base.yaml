@@ -2,7 +2,7 @@
 
 dataset:
   kind: hq
-  root: data/musdb18hq
+  root: /Users/alexhg/Documents/Tesis Mate/Datasets/musdb18hq
   sample_rate: 44100
 
 paths:
@@ -22,8 +22,9 @@ gate_thresholds:
   mono_track_fraction_min: 0.88
 
 training:
-  sample_rate: 22050
+  sample_rate: 16000
   frame_rate: 250
+  win_s: 4.0
   batch_size: 8
   learning_rate: 1e-3
   epochs: 50
@@ -44,5 +45,7 @@ loss:
   delta_freq_weight: 0.2
   delta_time_weight: 0.05
   mel_weight: 1.0
+  hf_mel_weight: 0.5
   centroid_weight: 0.05
+  transient_weight: 0.2
 

@@ -143,7 +143,7 @@ def mel_spectrogram(y: tf.Tensor,
                     n_fft: int = 1024,
                     hop_length: int = 256,
                     n_mels: int = 64,
-                    sr: int = 22050,
+                    sr: int = 16000,
                     fmin: float = 50.0,
                     fmax: Optional[float] = None) -> tf.Tensor:
     """Compute mel spectrogram.
@@ -186,7 +186,7 @@ def mel_spectrogram(y: tf.Tensor,
 def spectral_centroid(y: tf.Tensor,
                       n_fft: int = 1024,
                       hop_length: int = 256,
-                      sr: int = 22050) -> tf.Tensor:
+                      sr: int = 16000) -> tf.Tensor:
     """Compute spectral centroid.
     
     Args:

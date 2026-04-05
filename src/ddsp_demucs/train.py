@@ -14,9 +14,11 @@ class DDSPTrainer(keras.Model):
                  model: keras.Model,
                  loss_fn: Optional[Callable] = None,
                  mel_weight: float = 1.0,
+                 hf_mel_weight: float = 0.5,
                  centroid_weight: float = 0.05,
+                 transient_weight: float = 0.2,
                  sisdr_weight: float = 0.0,
-                 sample_rate: int = 22050,
+                 sample_rate: int = 16000,
                  n_fft: int = 1024,
                  hop_length: int = 256,
                  n_mels: int = 64):
@@ -26,7 +28,9 @@ class DDSPTrainer(keras.Model):
             model: DDSP model to train
             loss_fn: Spectral loss function (if None, creates default)
             mel_weight: Weight for mel loss
+            hf_mel_weight: Weight for high-frequency mel loss
             centroid_weight: Weight for spectral centroid loss
+            transient_weight: Weight for transient/onset loss
             sisdr_weight: Weight for SI-SDR loss
             sample_rate: Audio sample rate
             n_fft: FFT size
@@ -36,7 +40,9 @@ class DDSPTrainer(keras.Model):
         super().__init__()
         self.model = model
         self.mel_weight = mel_weight
+        self.hf_mel_weight = hf_mel_weight
         self.centroid_weight = centroid_weight
+        self.transient_weight = transient_weight
         self.sisdr_weight = sisdr_weight
         self.sample_rate = sample_rate
         self.n_fft = n_fft
@@ -53,7 +59,9 @@ class DDSPTrainer(keras.Model):
         self.val_metric = keras.metrics.Mean(name="val_loss")
         self.spec_metric = keras.metrics.Mean(name="spec")
         self.mel_metric = keras.metrics.Mean(name="mel")
+        self.hf_mel_metric = keras.metrics.Mean(name="hf_mel")
         self.cent_metric = keras.metrics.Mean(name="cent")
+        self.trans_metric = keras.metrics.Mean(name="trans")
         self.sisdr_metric = keras.metrics.Mean(name="sisdr")
     
     @property
@@ -61,7 +69,8 @@ class DDSPTrainer(keras.Model):
         return [
             self.train_metric, self.val_metric,
             self.spec_metric, self.mel_metric,
-            self.cent_metric, self.sisdr_metric
+            self.hf_mel_metric, self.cent_metric,
+            self.trans_metric, self.sisdr_metric
         ]
     
     def compile(self, optimizer, **kwargs):
@@ -96,6 +105,19 @@ class DDSPTrainer(keras.Model):
                             n_mels=self.n_mels, sr=self.sample_rate)
         n = tf.minimum(tf.shape(Yt)[1], tf.shape(Yp)[1])
         Lm = tf.reduce_mean(tf.abs(Yt[:, :n, :] - Yp[:, :n, :]))
+
+        # High-frequency mel loss for sibilance/detail preservation.
+        hf_fmax = float(self.sample_rate) * 0.49
+        Yt_hf = mel_spectrogram(
+            y_true, n_fft=512, hop_length=64, n_mels=self.n_mels,
+            sr=self.sample_rate, fmin=3000.0, fmax=hf_fmax
+        )
+        Yp_hf = mel_spectrogram(
+            y_pred, n_fft=512, hop_length=64, n_mels=self.n_mels,
+            sr=self.sample_rate, fmin=3000.0, fmax=hf_fmax
+        )
+        n_hf = tf.minimum(tf.shape(Yt_hf)[1], tf.shape(Yp_hf)[1])
+        Lhf = tf.reduce_mean(tf.abs(Yt_hf[:, :n_hf, :] - Yp_hf[:, :n_hf, :]))
         
         # Spectral centroid loss
         ct = spectral_centroid(y_true, n_fft=self.n_fft, hop_length=self.hop_length,
@@ -109,14 +131,28 @@ class DDSPTrainer(keras.Model):
             Ld = self._si_sdr_loss(y_true, y_pred)
         else:
             Ld = tf.constant(0.0, tf.float32)
+
+        # Transient loss via first-order temporal differences.
+        dy_t = y_true[:, 1:] - y_true[:, :-1]
+        dy_p = y_pred[:, 1:] - y_pred[:, :-1]
+        Lt = tf.reduce_mean(tf.abs(dy_t - dy_p))
         
-        total = Ls + self.mel_weight * Lm + self.centroid_weight * Lc + self.sisdr_weight * Ld
+        total = (
+            Ls
+            + self.mel_weight * Lm
+            + self.hf_mel_weight * Lhf
+            + self.centroid_weight * Lc
+            + self.transient_weight * Lt
+            + self.sisdr_weight * Ld
+        )
         
         return {
             "total": total,
             "spectral": Ls,
             "mel": Lm,
+            "hf_mel": Lhf,
             "centroid": Lc,
+            "transient": Lt,
             "sisdr": Ld
         }
     
@@ -179,14 +215,18 @@ class DDSPTrainer(keras.Model):
         self.train_metric.update_state(losses["total"])
         self.spec_metric.update_state(losses["spectral"])
         self.mel_metric.update_state(losses["mel"])
+        self.hf_mel_metric.update_state(losses["hf_mel"])
         self.cent_metric.update_state(losses["centroid"])
+        self.trans_metric.update_state(losses["transient"])
         self.sisdr_metric.update_state(losses["sisdr"])
         
         return {
             "loss": self.train_metric.result(),
             "spec": self.spec_metric.result(),
             "mel": self.mel_metric.result(),
+            "hf_mel": self.hf_mel_metric.result(),
             "cent": self.cent_metric.result(),
+            "trans": self.trans_metric.result(),
             "sisdr": self.sisdr_metric.result(),
         }
     
@@ -212,14 +252,18 @@ class DDSPTrainer(keras.Model):
         self.val_metric.update_state(losses["total"])
         self.spec_metric.update_state(losses["spectral"])
         self.mel_metric.update_state(losses["mel"])
+        self.hf_mel_metric.update_state(losses["hf_mel"])
         self.cent_metric.update_state(losses["centroid"])
+        self.trans_metric.update_state(losses["transient"])
         self.sisdr_metric.update_state(losses["sisdr"])
         
         return {
             "val_loss": self.val_metric.result(),
             "spec": self.spec_metric.result(),
             "mel": self.mel_metric.result(),
+            "hf_mel": self.hf_mel_metric.result(),
             "cent": self.cent_metric.result(),
+            "trans": self.trans_metric.result(),
             "sisdr": self.sisdr_metric.result(),
         }
 

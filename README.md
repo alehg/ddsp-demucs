@@ -128,7 +128,7 @@ build_tfrecords_from_segments(
     stems_dir=Path("data/stems/demucs_htdemucs44k"),
     musdb_root=Path("data/musdb18hq"),
     tfrecords_dir=Path("data/tfrecords"),
-    train_sr=22050,
+    train_sr=16000,
     win_s=4.0,
     hop_s=1.0,
 )

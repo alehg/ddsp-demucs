@@ -47,6 +47,7 @@ data/
 
 # Experiments and logs
 exp/
+results/
 logs/
 runs/
 checkpoints/
@@ -86,3 +87,5 @@ Thumbs.db
 /content/
 /drive/
 
+# Thesis Drafts
+thesis/

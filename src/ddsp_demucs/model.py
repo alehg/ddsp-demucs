@@ -6,20 +6,96 @@ import numpy as np
 import ddsp
 from ddsp.synths import Harmonic, FilteredNoise
 from ddsp.effects import Reverb
+from ddsp import spectral_ops
 from typing import Dict, Tuple, Optional
+
+
+class ZEncoder(keras.layers.Layer):
+    """DDSP-style latent encoder base class producing temporal latent z."""
+
+    def call(self, audio: tf.Tensor, f0_hz: tf.Tensor) -> tf.Tensor:
+        """Encode audio to z and align z time-steps to conditioning."""
+        time_steps = tf.shape(f0_hz)[1]
+        z = self.compute_z(audio)
+        return self.expand_z(z, time_steps)
+
+    def compute_z(self, audio: tf.Tensor) -> tf.Tensor:
+        """Encode audio and return latent z (override in subclasses)."""
+        raise NotImplementedError
+
+    def expand_z(self, z: tf.Tensor, time_steps: tf.Tensor) -> tf.Tensor:
+        """Expand/resample z so it matches conditioning frame length."""
+        if len(z.shape) == 2:
+            z = z[:, tf.newaxis, :]
+        z_time_steps = tf.shape(z)[1]
+        return tf.cond(
+            tf.equal(z_time_steps, time_steps),
+            lambda: z,
+            lambda: ddsp.core.resample(z, time_steps),
+        )
+
+
+class MfccTimeDistributedRnnEncoder(ZEncoder):
+    """MFCC encoder modeled after DDSP's time-distributed RNN encoders."""
+
+    def __init__(self,
+                 rnn_channels: int = 512,
+                 z_dims: int = 32,
+                 z_time_steps: int = 250,
+                 **kwargs):
+        super().__init__(**kwargs)
+        if z_time_steps not in [63, 125, 250, 500, 1000]:
+            raise ValueError("z_time_steps must be one of: 63, 125, 250, 500, 1000")
+
+        z_audio_spec = {
+            63: {"fft_size": 2048, "overlap": 0.5},
+            125: {"fft_size": 1024, "overlap": 0.5},
+            250: {"fft_size": 1024, "overlap": 0.75},
+            500: {"fft_size": 512, "overlap": 0.75},
+            1000: {"fft_size": 256, "overlap": 0.75},
+        }
+        self.fft_size = z_audio_spec[z_time_steps]["fft_size"]
+        self.overlap = z_audio_spec[z_time_steps]["overlap"]
+        self.z_norm = keras.layers.LayerNormalization(axis=-1)
+        self.rnn = keras.layers.GRU(rnn_channels, return_sequences=True)
+        self.dense_out = keras.layers.Dense(z_dims)
+        self.z_dims = z_dims
+
+    def compute_z(self, audio: tf.Tensor) -> tf.Tensor:
+        # Accept [B, T] or [B, T, 1]
+        if audio.shape.rank == 2:
+            audio = audio[..., tf.newaxis]
+        mfccs = spectral_ops.compute_mfcc(
+            audio,
+            lo_hz=20.0,
+            hi_hz=8000.0,
+            fft_size=self.fft_size,
+            mel_bins=128,
+            mfcc_bins=30,
+            overlap=self.overlap,
+            pad_end=True,
+        )
+        z = self.z_norm(mfccs)
+        z = self.rnn(z)
+        z = self.dense_out(z)
+        return z
 
 
 class DDSPDecoder(keras.Model):
     """DDSP decoder with harmonic + noise + reverb."""
     
     def __init__(self,
-                 sample_rate: int = 22050,
+                 sample_rate: int = 16000,
                  frame_rate: int = 250,
                  n_harmonics: int = 64,
                  n_noise_bands: int = 65,
                  rnn_units: int = 256,
                  mlp_units: Tuple[int, ...] = (256, 128),
                  f0_midi_range: Tuple[float, float] = (24.0, 84.0),
+                 z_dims: int = 32,
+                 z_time_steps: int = 250,
+                 z_rnn_channels: int = 512,
+                 z_encoder: Optional[keras.layers.Layer] = None,
                  **kwargs):
         """Initialize DDSP decoder.
         
@@ -38,6 +114,12 @@ class DDSPDecoder(keras.Model):
         self.n_harmonics = n_harmonics
         self.n_noise_bands = n_noise_bands
         self.f0midi_range = f0_midi_range
+        self.z_dims = z_dims
+        self.z_encoder = z_encoder or MfccTimeDistributedRnnEncoder(
+            rnn_channels=z_rnn_channels,
+            z_dims=z_dims,
+            z_time_steps=z_time_steps,
+        )
         
         # Feature encoder
         self.pre = keras.layers.Dense(128, activation='relu')
@@ -50,6 +132,8 @@ class DDSPDecoder(keras.Model):
         self.amp_head = keras.layers.Dense(1)
         self.harm_head = keras.layers.Dense(n_harmonics)
         self.noise_head = keras.layers.Dense(n_noise_bands)
+        self.noise_detail_head = keras.layers.Dense(n_noise_bands)
+        self.transient_head = keras.layers.Dense(1)
         
         # Synths and effects
         self.harm = Harmonic(sample_rate=sample_rate, amp_resample_method='linear')
@@ -64,7 +148,7 @@ class DDSPDecoder(keras.Model):
         """Forward pass.
         
         Args:
-            inputs: Dictionary with 'f0_hz' and 'loudness_db'
+            inputs: Dictionary with 'f0_hz', 'loudness_db', and optional 'x_in'
             training: Whether in training mode
             
         Returns:
@@ -72,11 +156,23 @@ class DDSPDecoder(keras.Model):
         """
         f0_hz = tf.cast(inputs["f0_hz"], tf.float32)
         ld_db = tf.cast(inputs["loudness_db"], tf.float32)
+        x_in = inputs.get("x_in", None)
+
+        # DDSP-style latent conditioning z from input audio (if available).
+        if x_in is not None:
+            x_in = tf.cast(x_in, tf.float32)
+            z = self.z_encoder(x_in, f0_hz)
+        else:
+            z = tf.zeros(
+                [tf.shape(f0_hz)[0], tf.shape(f0_hz)[1], self.z_dims],
+                dtype=tf.float32,
+            )
         
         # Convert to MIDI and stack features
         f0_midi = ddsp.core.hz_to_midi(tf.clip_by_value(f0_hz, 1.0, 8000.0))
         f0_midi = tf.clip_by_value(f0_midi, *self.f0midi_range)
-        x = tf.stack([f0_midi, ld_db], axis=-1)  # [B, T, 2]
+        x_base = tf.stack([f0_midi, ld_db], axis=-1)  # [B, T, 2]
+        x = tf.concat([x_base, z], axis=-1)  # [B, T, 2 + z_dims]
         
         # Process through network
         x = self.pre(x)
@@ -86,7 +182,20 @@ class DDSPDecoder(keras.Model):
         # Generate controls
         amp = ddsp.core.exp_sigmoid(self.amp_head(x))  # [B, T, 1]
         harm_dist = tf.nn.softmax(self.harm_head(x), axis=-1)  # [B, T, H]
-        noise_mag = ddsp.core.exp_sigmoid(self.noise_head(x))  # [B, T, BANDS]
+        # Two-headed noise control improves high-frequency detail for sibilance.
+        noise_logits = self.noise_head(x) + 0.5 * self.noise_detail_head(x)
+        noise_mag = ddsp.core.exp_sigmoid(noise_logits)  # [B, T, BANDS]
+
+        # Voicing-aware control: suppress harmonics for unvoiced frames.
+        voiced = tf.cast(f0_hz > 1.0, tf.float32)[..., tf.newaxis]  # [B, T, 1]
+        voiced = tf.nn.avg_pool1d(voiced, ksize=5, strides=1, padding="SAME")
+        voiced = tf.clip_by_value(voiced, 0.0, 1.0)
+        unvoiced = 1.0 - voiced
+
+        # Extra transient/noise emphasis helps plosives and sibilance.
+        transient_env = tf.nn.sigmoid(self.transient_head(x))  # [B, T, 1]
+        amp = amp * (0.5 + 0.5 * voiced)
+        noise_mag = noise_mag * (0.6 + 0.8 * unvoiced) * (1.0 + 0.8 * transient_env * unvoiced)
         
         # Synthesize
         f0_hz_3d = f0_hz[..., tf.newaxis]  # [B, T, 1]
@@ -148,7 +257,7 @@ class SpectralMaskEQ(keras.layers.Layer):
                  n_bands: int = 65,
                  alpha: float = 0.15,
                  enc_units: int = 64,
-                 sample_rate: int = 22050,
+                 sample_rate: int = 16000,
                  window_size: int = 176,
                  **kwargs):
         """Initialize spectral mask EQ.

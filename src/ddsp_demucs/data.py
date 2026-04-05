@@ -175,7 +175,7 @@ def build_tfrecords_from_segments(
     stems_dir: Path,
     musdb_root: Path,
     tfrecords_dir: Path,
-    train_sr: int = 22050,
+    train_sr: int = 16000,
     win_s: float = 4.0,
     hop_s: float = 1.0,
     examples_per_shard: int = 512,

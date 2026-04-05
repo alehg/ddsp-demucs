@@ -58,7 +58,7 @@ def spectral_convergence(a: np.ndarray,
 def evaluate_model(model: tf.keras.Model,
                    dataset: tf.data.Dataset,
                    n_examples: Optional[int] = None,
-                   sample_rate: int = 22050) -> Dict[str, List[float]]:
+                   sample_rate: int = 16000) -> Dict[str, List[float]]:
     """Evaluate model on dataset.
     
     Args:
