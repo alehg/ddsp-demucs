@@ -1,4 +1,4 @@
-# Base configuration for DDSP-Demucs
+# Tuned config for dual-FIR DDSP direct experiment.
 
 dataset:
   kind: hq
@@ -39,8 +39,6 @@ model:
   z_dims: 64
   z_time_steps: 250
   z_rnn_channels: 512
-  # Multiplicative learned + loudness gate on harmonic/noise (see DDSPDecoder).
-  use_learned_output_gate: false
 
 loss:
   fft_sizes: [2048, 1024, 512, 256, 128, 64]
@@ -49,8 +47,7 @@ loss:
   logmag_weight: 0.2
   delta_freq_weight: 0.2
   delta_time_weight: 0.05
-  mel_weight: 1.0
-  hf_mel_weight: 0.5
-  centroid_weight: 0.05
-  transient_weight: 0.2
-
+  mel_weight: 0.8
+  hf_mel_weight: 1.5
+  centroid_weight: 0.1
+  transient_weight: 0.3

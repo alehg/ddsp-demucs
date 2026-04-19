@@ -5,7 +5,7 @@ import tensorflow.keras as keras
 import numpy as np
 import ddsp
 from ddsp.synths import Harmonic, FilteredNoise
-from ddsp.effects import Reverb
+from ddsp.effects import Reverb, FIRFilter
 from ddsp import spectral_ops
 from typing import Dict, Tuple, Optional
 
@@ -95,7 +95,16 @@ class DDSPDecoder(keras.Model):
                  z_dims: int = 32,
                  z_time_steps: int = 250,
                  z_rnn_channels: int = 512,
+                 harmonic_base_gain: float = 0.5,
+                 harmonic_voiced_gain: float = 0.5,
+                 noise_base_gain: float = 0.6,
+                 noise_unvoiced_gain: float = 0.8,
+                 noise_transient_gain: float = 0.8,
                  z_encoder: Optional[keras.layers.Layer] = None,
+                 use_learned_output_gate: bool = False,
+                 consonant_noise_enhancements: bool = False,
+                 voiced_transient_noise_leak: float = 0.32,
+                 use_noise_ducking: bool = False,
                  **kwargs):
         """Initialize DDSP decoder.
         
@@ -107,6 +116,20 @@ class DDSPDecoder(keras.Model):
             rnn_units: GRU units
             mlp_units: MLP layer sizes
             f0_midi_range: F0 range in MIDI notes
+            use_learned_output_gate: If True, multiply harmonic and noise audio by a
+                frame-rate gate resampled to samples: smooth(sigmoid(Dense(x))) times
+                a smooth sigmoid of loudness_db (learnable center/scale), then linearly
+                resampled to waveform length before the harmonic+noise sum.
+            consonant_noise_enhancements: If True, add sharper noise dynamics: per-frame
+                noise envelope head (unpooled), transient-driven noise on weakly voiced
+                frames, and (with output gate) a transient-boosted noise gate vs smooth
+                harmonic gate.
+            voiced_transient_noise_leak: When enhancements are on, fraction [0,1] of
+                transient noise emphasis that also applies on voiced frames (consonants
+                in vowel context). Ignored when consonant_noise_enhancements is False.
+            use_noise_ducking: If True, attenuate the noise waveform (not harmonics) on
+                sustained voiced frames so consonant bursts can decay toward a more tonal
+                mix. Applied after branch gates, before harmonic+noise sum.
         """
         super().__init__(**kwargs)
         self.sample_rate = sample_rate
@@ -115,6 +138,17 @@ class DDSPDecoder(keras.Model):
         self.n_noise_bands = n_noise_bands
         self.f0midi_range = f0_midi_range
         self.z_dims = z_dims
+        self.harmonic_base_gain = float(harmonic_base_gain)
+        self.harmonic_voiced_gain = float(harmonic_voiced_gain)
+        self.noise_base_gain = float(noise_base_gain)
+        self.noise_unvoiced_gain = float(noise_unvoiced_gain)
+        self.noise_transient_gain = float(noise_transient_gain)
+        self.use_learned_output_gate = bool(use_learned_output_gate)
+        self.consonant_noise_enhancements = bool(consonant_noise_enhancements)
+        self.voiced_transient_noise_leak = float(
+            min(1.0, max(0.0, voiced_transient_noise_leak))
+        )
+        self.use_noise_ducking = bool(use_noise_ducking)
         self.z_encoder = z_encoder or MfccTimeDistributedRnnEncoder(
             rnn_channels=z_rnn_channels,
             z_dims=z_dims,
@@ -133,8 +167,47 @@ class DDSPDecoder(keras.Model):
         self.harm_head = keras.layers.Dense(n_harmonics)
         self.noise_head = keras.layers.Dense(n_noise_bands)
         self.noise_detail_head = keras.layers.Dense(n_noise_bands)
+        self.harmonic_filter_head = keras.layers.Dense(n_noise_bands)
+        self.noise_filter_head = keras.layers.Dense(n_noise_bands)
         self.transient_head = keras.layers.Dense(1)
-        
+        if self.consonant_noise_enhancements:
+            # Sharp per-frame noise loudness (no temporal pooling) for consonant bursts.
+            self.noise_envelope_head = keras.layers.Dense(1)
+        if self.use_noise_ducking:
+            self.noise_duck_head = keras.layers.Dense(1)
+            self._noise_duck_strength_raw = self.add_weight(
+                name="noise_duck_strength_raw",
+                shape=(),
+                initializer=keras.initializers.Constant(1.0),
+                trainable=True,
+                dtype=tf.float32,
+            )
+        if self.use_learned_output_gate:
+            self.gate_head = keras.layers.Dense(1)
+            self.gate_ld_bias = self.add_weight(
+                name="gate_ld_bias",
+                shape=(),
+                initializer=keras.initializers.Constant(-55.0),
+                trainable=True,
+                dtype=tf.float32,
+            )
+            self.gate_ld_scale = self.add_weight(
+                name="gate_ld_scale",
+                shape=(),
+                initializer=keras.initializers.Constant(0.2),
+                trainable=True,
+                dtype=tf.float32,
+            )
+            if self.consonant_noise_enhancements:
+                # Scales how much transient_head opens the noise branch of the output gate.
+                self.noise_gate_transient_boost = self.add_weight(
+                    name="noise_gate_transient_boost",
+                    shape=(),
+                    initializer=keras.initializers.Constant(1.15),
+                    trainable=True,
+                    dtype=tf.float32,
+                )
+
         # Synths and effects
         self.harm = Harmonic(sample_rate=sample_rate, amp_resample_method='linear')
         self.noise = FilteredNoise(
@@ -142,6 +215,8 @@ class DDSPDecoder(keras.Model):
             scale_fn=ddsp.core.exp_sigmoid,
             initial_bias=-5.0
         )
+        self.harmonic_fir = FIRFilter(window_size=257, scale_fn=ddsp.core.exp_sigmoid)
+        self.noise_fir = FIRFilter(window_size=257, scale_fn=ddsp.core.exp_sigmoid)
         self.reverb = Reverb(trainable=True)
     
     def call(self, inputs: Dict[str, tf.Tensor], training: bool = False) -> tf.Tensor:
@@ -185,6 +260,9 @@ class DDSPDecoder(keras.Model):
         # Two-headed noise control improves high-frequency detail for sibilance.
         noise_logits = self.noise_head(x) + 0.5 * self.noise_detail_head(x)
         noise_mag = ddsp.core.exp_sigmoid(noise_logits)  # [B, T, BANDS]
+        # Separate DDSP FIR envelopes for harmonic and noise branches.
+        harmonic_filter_mag = ddsp.core.exp_sigmoid(self.harmonic_filter_head(x))
+        noise_filter_mag = ddsp.core.exp_sigmoid(self.noise_filter_head(x))
 
         # Voicing-aware control: suppress harmonics for unvoiced frames.
         voiced = tf.cast(f0_hz > 1.0, tf.float32)[..., tf.newaxis]  # [B, T, 1]
@@ -194,19 +272,91 @@ class DDSPDecoder(keras.Model):
 
         # Extra transient/noise emphasis helps plosives and sibilance.
         transient_env = tf.nn.sigmoid(self.transient_head(x))  # [B, T, 1]
-        amp = amp * (0.5 + 0.5 * voiced)
-        noise_mag = noise_mag * (0.6 + 0.8 * unvoiced) * (1.0 + 0.8 * transient_env * unvoiced)
+        amp = amp * (self.harmonic_base_gain + self.harmonic_voiced_gain * voiced)
+        noise_mag = noise_mag * (self.noise_base_gain + self.noise_unvoiced_gain * unvoiced)
+        if self.consonant_noise_enhancements:
+            # Let consonants on voiced frames drive noise, not only unvoiced F0 bins.
+            t_mask = unvoiced + self.voiced_transient_noise_leak * voiced
+            noise_mag = noise_mag * (1.0 + self.noise_transient_gain * transient_env * t_mask)
+            noise_env = 0.12 + 1.88 * tf.nn.sigmoid(self.noise_envelope_head(x))
+            noise_mag = noise_mag * noise_env
+        else:
+            noise_mag = noise_mag * (1.0 + self.noise_transient_gain * transient_env * unvoiced)
         
         # Synthesize
         f0_hz_3d = f0_hz[..., tf.newaxis]  # [B, T, 1]
         audio_h = self.harm(amplitudes=amp, harmonic_distribution=harm_dist, f0_hz=f0_hz_3d)
         audio_n = self.noise(magnitudes=noise_mag)
+        if x_in is not None:
+            filtered_h = self.harmonic_fir(audio=audio_h, magnitudes=harmonic_filter_mag)
+            if filtered_h.shape.rank == 3:
+                filtered_h = filtered_h[..., 0]
+            audio_h = tf.cast(filtered_h, tf.float32)
+            filtered_n = self.noise_fir(audio=audio_n, magnitudes=noise_filter_mag)
+            if filtered_n.shape.rank == 3:
+                filtered_n = filtered_n[..., 0]
+            audio_n = tf.cast(filtered_n, tf.float32)
         
         # Align lengths
         min_len = tf.minimum(tf.shape(audio_h)[-1], tf.shape(audio_n)[-1])
         audio_h = audio_h[..., :min_len]
         audio_n = audio_n[..., :min_len]
-        
+
+        if self.use_learned_output_gate:
+            # Frame-rate multiplicative gate (learned + loudness), temporally smoothed,
+            # then resampled to audio samples. Harmonics use the smooth gate; with
+            # consonant enhancements, noise uses the same base gate times a transient
+            # boost (sharp — no extra pooling) so sibilants/plosives can punch through.
+            g_learn = tf.nn.sigmoid(self.gate_head(x))  # [B, T, 1]
+            g_learn = tf.nn.avg_pool1d(g_learn, ksize=9, strides=1, padding="SAME")
+            g_learn = tf.clip_by_value(g_learn, 0.0, 1.0)
+            ld_db_3 = ld_db[..., tf.newaxis] if ld_db.shape.rank == 2 else ld_db
+            ld_factor = tf.nn.sigmoid((ld_db_3 - self.gate_ld_bias) * self.gate_ld_scale)
+            ld_factor = tf.nn.avg_pool1d(ld_factor, ksize=5, strides=1, padding="SAME")
+            ld_factor = tf.clip_by_value(ld_factor, 0.0, 1.0)
+            gate_frame = g_learn * ld_factor
+            gate_frame = tf.nn.avg_pool1d(gate_frame, ksize=3, strides=1, padding="SAME")
+            gate_frame = tf.clip_by_value(gate_frame, 0.0, 1.0)
+            n_samples = tf.shape(audio_h)[-1]
+            gate_audio_h = ddsp.core.resample(
+                tf.squeeze(gate_frame, axis=-1), n_samples, method="linear"
+            )
+            gate_audio_h = tf.clip_by_value(gate_audio_h, 0.0, 1.0)
+            audio_h = audio_h * gate_audio_h
+            if self.consonant_noise_enhancements:
+                boost = tf.nn.relu(self.noise_gate_transient_boost)
+                gate_n = gate_frame * (1.0 + boost * transient_env)
+                gate_n = tf.clip_by_value(gate_n, 0.0, 2.5)
+                gate_audio_n = ddsp.core.resample(
+                    tf.squeeze(gate_n, axis=-1), n_samples, method="linear"
+                )
+                gate_audio_n = tf.clip_by_value(gate_audio_n, 0.0, 2.5)
+                audio_n = audio_n * gate_audio_n
+            else:
+                audio_n = audio_n * gate_audio_h
+
+        if self.use_noise_ducking:
+            # Noise-only ducking: keep noise full on unvoiced / transients; attenuate on
+            # sustained voiced (vowel-like) so harmonics dominate, closer to singing.
+            transient_smooth = tf.nn.avg_pool1d(
+                transient_env, ksize=5, strides=1, padding="SAME"
+            )
+            transient_smooth = tf.clip_by_value(transient_smooth, 0.0, 1.0)
+            sustained_voiced = voiced * (1.0 - transient_smooth)
+            sustained_voiced = tf.clip_by_value(sustained_voiced, 0.0, 1.0)
+            duck_w = tf.nn.sigmoid(self._noise_duck_strength_raw)
+            structure = 1.0 - duck_w * sustained_voiced
+            structure = tf.clip_by_value(structure, 0.06, 1.0)
+            fine = 0.18 + 0.82 * tf.nn.sigmoid(self.noise_duck_head(x))
+            duck_frame = structure * fine
+            duck_frame = tf.clip_by_value(duck_frame, 0.06, 1.0)
+            n_d = tf.shape(audio_n)[-1]
+            duck_audio = ddsp.core.resample(
+                tf.squeeze(duck_frame, axis=-1), n_d, method="linear"
+            )
+            duck_audio = tf.clip_by_value(duck_audio, 0.06, 1.0)
+            audio_n = audio_n * duck_audio
+
         audio = audio_h + audio_n
         audio = self.reverb(audio)
         
@@ -216,10 +366,20 @@ class DDSPDecoder(keras.Model):
 class ResidualDDSPDecoder(DDSPDecoder):
     """DDSP decoder that predicts residual correction to input."""
     
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        # Learnable dry/wet mix
-        self.dry_logit = tf.Variable(-6.0, trainable=True, name="dry_logit")
+    def __init__(self, dry_logit_init: float = -6.0, **kwargs):
+        """Args:
+            dry_logit_init: Initial value for the global dry/wet logit before `sigmoid`.
+                Default -6 ⇒ ~0.25% x_in, ~99.75% synth. Use 0.0 for ~50/50 x_in vs synth at init.
+        """
+        super().__init__(**kwargs)
+        # Learnable dry/wet mix (must use add_weight so Keras tracks it for train/save/load).
+        self.dry_logit = self.add_weight(
+            name="dry_logit",
+            shape=(),
+            initializer=keras.initializers.Constant(float(dry_logit_init)),
+            trainable=True,
+            dtype=tf.float32,
+        )
     
     def call(self, inputs: Dict[str, tf.Tensor], training: bool = False) -> tf.Tensor:
         """Forward pass with residual connection.

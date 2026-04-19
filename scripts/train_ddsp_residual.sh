@@ -1,18 +1,13 @@
-#!/bin/bash
-# Train DDSP residual model
+#!/usr/bin/env bash
+# Train residual DDSP (same data path / flags style as train_exp001_ddsp_direct.py).
+set -euo pipefail
+cd "$(dirname "$0")/.."
 
-set -e
+CONFIG="${CONFIG:-configs/exp001_dualfir_tuned.yaml}"
+EXP_NAME="${EXP_NAME:-exp001_ddsp_residual}"
 
-CONFIG=${1:-configs/base.yaml}
-EXP_NAME=${2:-exp001_baseline_ddsp}
-
-echo "Training with config: $CONFIG"
-echo "Experiment name: $EXP_NAME"
-
-python -m ddsp_demucs.train \
-    --config "$CONFIG" \
-    --exp_name "$EXP_NAME" \
-    --gpu 0
-
-echo "Training complete!"
-
+python scripts/train_exp001_ddsp_residual.py \
+  --exp-name "$EXP_NAME" \
+  --config "$CONFIG" \
+  --seed 1337 \
+  "$@"

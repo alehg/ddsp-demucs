@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Train Experiment 001: DDSP direct model on TFRecords."""
+"""Train Experiment 001: residual DDSP decoder (dry/wet mix over Demucs input)."""
 
 from __future__ import annotations
 
@@ -34,10 +34,10 @@ def _install_crepe_stub() -> None:
 
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Train DDSP direct (exp001)")
+    p = argparse.ArgumentParser(description="Train DDSP residual (exp001)")
     p.add_argument("--config", type=Path, default=Path("configs/base.yaml"), help="Base experiment config")
     p.add_argument("--env-config", type=Path, default=Path("env/config.yaml"), help="Environment/path config")
-    p.add_argument("--exp-name", type=str, default="exp001_ddsp_direct")
+    p.add_argument("--exp-name", type=str, default="exp001_ddsp_residual")
     p.add_argument("--tfrecords-dir", type=Path, default=None)
     p.add_argument("--features-dir", type=Path, default=None)
     p.add_argument("--output-root", type=Path, default=Path("results"))
@@ -60,7 +60,15 @@ def parse_args() -> argparse.Namespace:
         "--initial-weights",
         type=Path,
         default=None,
-        help="Optional .h5 from a prior run (e.g. stage-1 checkpoints/ddsp.best.weights.h5); loads inner DDSP weights after build",
+        help="Optional .h5 from a prior run (e.g. direct or residual checkpoints/ddsp.best.weights.h5); "
+        "loads with skip_mismatch when supported so a direct checkpoint can warm-start the shared trunk",
+    )
+    p.add_argument(
+        "--dry-logit-init",
+        type=float,
+        default=-6.0,
+        help="Initial value for global dry/wet logit (before sigmoid). Default -6 ≈ 99.75%% synth; "
+        "0.0 ≈ 50%% x_in / 50%% synth at start. Omit --initial-weights for a cold start.",
     )
     p.add_argument(
         "--early-stopping-patience",
@@ -77,6 +85,15 @@ def _fix_len(v: np.ndarray, n_frames: int) -> np.ndarray:
     out = np.zeros((n_frames,), dtype=np.float32)
     out[: len(v)] = v.astype(np.float32)
     return out
+
+
+def _load_weights_allow_extra(model: tf.keras.Model, path: Path) -> None:
+    """Load weights; use skip_mismatch when available (e.g. direct ckpt -> residual)."""
+    p = str(path)
+    try:
+        model.load_weights(p, skip_mismatch=True)
+    except TypeError:
+        model.load_weights(p)
 
 
 def main() -> None:
@@ -115,7 +132,7 @@ def main() -> None:
 
     _install_crepe_stub()
     from ddsp_demucs.data import parse_tfrecord_example
-    from ddsp_demucs.model import DDSPDecoder
+    from ddsp_demucs.model import ResidualDDSPDecoder
     from ddsp_demucs.train import DDSPTrainer, setup_training_environment
 
     train_files = sorted((tfrecords_dir / "train").glob("*.tfrecord"))
@@ -127,8 +144,6 @@ def main() -> None:
     if not train_files or not val_files:
         raise RuntimeError(f"Missing TFRecords under {tfrecords_dir}/train or /val")
 
-    # Compute finite epoch lengths so Keras doesn't infer unknown cardinality.
-    # This avoids "input ran out of data" warnings and keeps epochs deterministic.
     train_example_count = int(
         tf.data.TFRecordDataset([str(f) for f in train_files], num_parallel_reads=tf.data.AUTOTUNE)
         .reduce(tf.constant(0, tf.int64), lambda acc, _: acc + 1)
@@ -168,8 +183,8 @@ def main() -> None:
         if fb <= fa:
             fb = fa + n_frames
 
-        f0 = _fix_len(f0_all[max(0, fa):max(0, fb)], n_frames)
-        ld = _fix_len(ld_all[max(0, fa):max(0, fb)], n_frames)
+        f0 = _fix_len(f0_all[max(0, fa) : max(0, fb)], n_frames)
+        ld = _fix_len(ld_all[max(0, fa) : max(0, fb)], n_frames)
         return f0, ld
 
     def _map_to_cond(ex: dict):
@@ -205,7 +220,8 @@ def main() -> None:
 
     setup_training_environment(use_mixed_precision=False, gpu_memory_growth=True, xla_jit=False)
 
-    model = DDSPDecoder(
+    model = ResidualDDSPDecoder(
+        dry_logit_init=float(args.dry_logit_init),
         sample_rate=sample_rate,
         frame_rate=frame_rate,
         n_harmonics=int(model_cfg.get("n_harmonics", 64)),
@@ -237,7 +253,6 @@ def main() -> None:
         sisdr_weight=sisdr_weight,
     )
 
-    # Build model/trainer state before checkpoint callback serialization.
     sample_cond, _sample_target = next(iter(ds_train.take(1)))
     _ = model(sample_cond, training=False)
 
@@ -245,14 +260,7 @@ def main() -> None:
     if initial_weights_path is not None:
         if not initial_weights_path.is_file():
             raise FileNotFoundError(f"--initial-weights not found: {initial_weights_path}")
-        # New layers (e.g. learned output gate) are absent from older checkpoints.
-        if use_learned_output_gate or consonant_noise_enhancements or use_noise_ducking:
-            try:
-                model.load_weights(str(initial_weights_path), skip_mismatch=True)
-            except TypeError:
-                model.load_weights(str(initial_weights_path))
-        else:
-            model.load_weights(str(initial_weights_path))
+        _load_weights_allow_extra(model, initial_weights_path)
         print(f"Loaded warm-start weights from {initial_weights_path}")
 
     optimizer_kwargs = {"learning_rate": learning_rate}
@@ -315,6 +323,7 @@ def main() -> None:
 
     run_cfg = {
         "exp_name": args.exp_name,
+        "model_kind": "residual",
         "sample_rate": sample_rate,
         "frame_rate": frame_rate,
         "win_s": win_s,
@@ -331,17 +340,18 @@ def main() -> None:
         "noise_base_gain": float(args.noise_base_gain),
         "noise_unvoiced_gain": float(args.noise_unvoiced_gain),
         "noise_transient_gain": float(args.noise_transient_gain),
-        "use_learned_output_gate": use_learned_output_gate,
-        "consonant_noise_enhancements": consonant_noise_enhancements,
-        "voiced_transient_noise_leak": voiced_transient_noise_leak,
-        "hf_onset_weight": hf_onset_weight,
-        "use_noise_ducking": use_noise_ducking,
         "num_train_shards": len(train_files),
         "num_val_shards": len(val_files),
         "train_steps": fit_kwargs["steps_per_epoch"],
         "val_steps": fit_kwargs["validation_steps"],
         "initial_weights": str(initial_weights_path) if initial_weights_path else None,
+        "dry_logit_init": float(args.dry_logit_init),
         "early_stopping_patience": int(args.early_stopping_patience),
+        "use_learned_output_gate": use_learned_output_gate,
+        "consonant_noise_enhancements": consonant_noise_enhancements,
+        "voiced_transient_noise_leak": voiced_transient_noise_leak,
+        "hf_onset_weight": hf_onset_weight,
+        "use_noise_ducking": use_noise_ducking,
     }
     run_cfg_path = out_root / "run_config.json"
     run_cfg_path.write_text(json.dumps(run_cfg, indent=2))
@@ -349,8 +359,8 @@ def main() -> None:
     print(f"Wrote: {history_path}")
     print(f"Wrote: {run_cfg_path}")
     print(f"Best checkpoint expected at: {ckpt_dir / 'ddsp.best.weights.h5'}")
+    print("Evaluate with: python scripts/evaluate_experiment_summary.py --exp-name <name> --model-kind residual ...")
 
 
 if __name__ == "__main__":
     main()
-

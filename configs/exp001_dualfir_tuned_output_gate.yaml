@@ -1,4 +1,5 @@
-# Base configuration for DDSP-Demucs
+# Same as exp001_dualfir_tuned.yaml plus learned multiplicative output gate on DDSPDecoder.
+# Use with the same CLI overrides as expB2_dualfir_z64_stage2_sisdr (stage-2 recipe).
 
 dataset:
   kind: hq
@@ -36,11 +37,15 @@ model:
   rnn_units: 256
   mlp_units: [256, 128]
   f0_midi_range: [24.0, 84.0]
-  z_dims: 64
+  z_dims: 128
   z_time_steps: 250
   z_rnn_channels: 512
-  # Multiplicative learned + loudness gate on harmonic/noise (see DDSPDecoder).
-  use_learned_output_gate: false
+  use_learned_output_gate: true
+  # Sharper filtered-noise dynamics + split harmonic/noise output gates (see DDSPDecoder).
+  consonant_noise_enhancements: true
+  voiced_transient_noise_leak: 0.36
+  # Attenuate noise (not harmonics) after consonants on sustained voiced frames.
+  use_noise_ducking: true
 
 loss:
   fft_sizes: [2048, 1024, 512, 256, 128, 64]
@@ -49,8 +54,8 @@ loss:
   logmag_weight: 0.2
   delta_freq_weight: 0.2
   delta_time_weight: 0.05
-  mel_weight: 1.0
-  hf_mel_weight: 0.5
-  centroid_weight: 0.05
-  transient_weight: 0.2
-
+  mel_weight: 0.8
+  hf_mel_weight: 2.0
+  centroid_weight: 0.1
+  transient_weight: 0.38
+  hf_onset_weight: 0.15
